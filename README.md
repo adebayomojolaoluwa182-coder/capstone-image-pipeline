@@ -4,6 +4,8 @@ COMP 200 capstone project — Adebayo mojolaoluwa
 
 This application creates JPEG thumbnails, at most 300 by 300 pixels, from images in a private S3 originals bucket. It preserves aspect ratio, corrects EXIF orientation, and never enlarges small images. A Standard Step Functions workflow runs a resizing Lambda, checks its result, and ends in an explicit success or failure state.
 
+The deployed capstone was tested successfully on November 16, 2026. See [deployment values and verified test results](docs/deployment.md) for the actual bucket names, workflow ARN, API URL, and test limitations.
+
 ## Architecture
 
 ```mermaid
