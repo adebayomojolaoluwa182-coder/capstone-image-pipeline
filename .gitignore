@@ -1,0 +1,9 @@
+build/
+__pycache__/
+*.pyc
+.venv/
+.env
+deployment-outputs.json
+*.mp4
+*.zip
+evidence/

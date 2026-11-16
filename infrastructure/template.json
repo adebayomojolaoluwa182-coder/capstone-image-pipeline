@@ -1,0 +1,556 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "COMP 200 serverless image processing capstone",
+  "Parameters": {
+    "PillowLayerArn": {
+      "Type": "String",
+      "Description": "Python 3.12 x86_64 Linux Pillow layer version ARN",
+      "AllowedPattern": "arn:[^:]+:lambda:[^:]+:[0-9]{12}:layer:[^:]+:[0-9]+"
+    }
+  },
+  "Resources": {
+    "ResizeLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${AWS::StackName}-resize"
+        },
+        "RetentionInDays": 7
+      }
+    },
+    "StarterLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/aws/lambda/${AWS::StackName}-starter"
+        },
+        "RetentionInDays": 7
+      }
+    },
+    "ResizeRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "CapstoneResourceAccess",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject",
+                    "s3:GetObjectVersion"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${AWS::StackName}-originals-${AWS::AccountId}-${AWS::Region}/*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "s3:PutObject",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${AWS::StackName}-thumbnails-${AWS::AccountId}-${AWS::Region}/thumbnails/*"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-resize:*"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "Resize": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "ResizeLogs",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${AWS::StackName}-resize"
+        },
+        "Runtime": "python3.12",
+        "Architectures": [
+          "x86_64"
+        ],
+        "Handler": "index.lambda_handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "ResizeRole",
+            "Arn"
+          ]
+        },
+        "Timeout": 30,
+        "MemorySize": 512,
+        "Layers": [
+          {
+            "Ref": "PillowLayerArn"
+          }
+        ],
+        "Environment": {
+          "Variables": {
+            "SOURCE_BUCKET": {
+              "Fn::Sub": "${AWS::StackName}-originals-${AWS::AccountId}-${AWS::Region}"
+            },
+            "DESTINATION_BUCKET": {
+              "Fn::Sub": "${AWS::StackName}-thumbnails-${AWS::AccountId}-${AWS::Region}"
+            }
+          }
+        },
+        "Code": {
+          "ZipFile": "\"\"\"Resize an S3 image into a JPEG thumbnail for a Step Functions Task.\"\"\"\nimport hashlib\nimport io\nimport logging\nimport os\nimport warnings\nfrom pathlib import PurePosixPath\n\nimport boto3\nfrom botocore.exceptions import ClientError\nfrom PIL import Image, ImageOps, UnidentifiedImageError\n\nLOG = logging.getLogger(__name__)\nLOG.setLevel(logging.INFO)\nS3 = boto3.client(\"s3\")\nImage.MAX_IMAGE_PIXELS = 20_000_000\nMAX_BYTES = 10 * 1024 * 1024\nTHUMBNAIL_SIZE = (300, 300)\n\n\ndef rejected(message):\n    return {\"success\": False, \"message\": message}\n\n\ndef lambda_handler(event, context):\n    \"\"\"Input: {bucket, key, versionId?}. Output includes success for Choice.\"\"\"\n    bucket, key = event.get(\"bucket\"), event.get(\"key\")\n    if bucket != os.environ[\"SOURCE_BUCKET\"]:\n        return rejected(\"The source bucket is not the configured originals bucket.\")\n    if not isinstance(key, str) or not key or len(key.encode(\"utf-8\")) > 1024:\n        return rejected(\"A valid image object key is required.\")\n    request = {\"Bucket\": bucket, \"Key\": key}\n    if event.get(\"versionId\"):\n        request[\"VersionId\"] = event[\"versionId\"]\n    try:\n        response = S3.get_object(**request)\n    except ClientError as error:\n        if error.response[\"Error\"][\"Code\"] in (\"NoSuchKey\", \"NoSuchVersion\", \"404\"):\n            return rejected(\"The requested source image was not found.\")\n        raise  # Service and permission errors remain visible to Step Functions.\n    with response[\"Body\"] as stream:\n        if response.get(\"ContentLength\", 0) > MAX_BYTES:\n            return rejected(\"The source image exceeds the 10 MiB size limit.\")\n        payload = stream.read(MAX_BYTES + 1)\n    if len(payload) > MAX_BYTES:\n        return rejected(\"The source image exceeds the 10 MiB size limit.\")\n    try:\n        with warnings.catch_warnings():\n            warnings.simplefilter(\"error\", Image.DecompressionBombWarning)\n            with Image.open(io.BytesIO(payload)) as image:\n                if image.format not in (\"JPEG\", \"PNG\", \"WEBP\"):\n                    return rejected(\"Supported formats are JPEG, PNG, and WebP.\")\n                original_size = image.size\n                oriented = ImageOps.exif_transpose(image)\n                oriented.thumbnail(THUMBNAIL_SIZE, Image.Resampling.LANCZOS)\n                rgba = oriented.convert(\"RGBA\")\n                thumbnail = Image.new(\"RGB\", rgba.size, \"white\")\n                thumbnail.paste(rgba, mask=rgba.getchannel(\"A\"))\n                output = io.BytesIO()\n                thumbnail.save(output, format=\"JPEG\", quality=85, optimize=True)\n                final_size = thumbnail.size\n    except (UnidentifiedImageError, OSError, ValueError,\n            Image.DecompressionBombError, Image.DecompressionBombWarning):\n        return rejected(\"The object is not a valid image within the supported limits.\")\n    digest = hashlib.sha256(payload).hexdigest()[:20]\n    stem = PurePosixPath(key).stem[:80] or \"image\"\n    output_key = f\"thumbnails/{stem}-{digest}.jpg\"\n    S3.put_object(Bucket=os.environ[\"DESTINATION_BUCKET\"], Key=output_key,\n                  Body=output.getvalue(), ContentType=\"image/jpeg\")\n    result = {\"success\": True, \"sourceBucket\": bucket, \"sourceKey\": key,\n              \"outputBucket\": os.environ[\"DESTINATION_BUCKET\"],\n              \"outputKey\": output_key, \"originalSize\": list(original_size),\n              \"thumbnailSize\": list(final_size)}\n    LOG.info(\"Image resized successfully: %s\", result)\n    return result\n"
+        }
+      }
+    },
+    "WorkflowRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "states.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "CapstoneResourceAccess",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "lambda:InvokeFunction",
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "Resize",
+                      "Arn"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "Workflow": {
+      "Type": "AWS::StepFunctions::StateMachine",
+      "Properties": {
+        "StateMachineName": {
+          "Fn::Sub": "${AWS::StackName}-workflow"
+        },
+        "StateMachineType": "STANDARD",
+        "RoleArn": {
+          "Fn::GetAtt": [
+            "WorkflowRole",
+            "Arn"
+          ]
+        },
+        "Definition": {
+          "Comment": "Resize an image, check success, and end explicitly.",
+          "StartAt": "ResizeImage",
+          "TimeoutSeconds": 120,
+          "States": {
+            "ResizeImage": {
+              "Type": "Task",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "Resize",
+                  "Arn"
+                ]
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.error",
+                  "Next": "ProcessingFailed"
+                }
+              ],
+              "Next": "ResizeSuccessful"
+            },
+            "ResizeSuccessful": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.success",
+                  "BooleanEquals": true,
+                  "Next": "ProcessingSucceeded"
+                }
+              ],
+              "Default": "ProcessingFailed"
+            },
+            "ProcessingSucceeded": {
+              "Type": "Succeed"
+            },
+            "ProcessingFailed": {
+              "Type": "Fail",
+              "Error": "ImageProcessingFailed",
+              "Cause": "The image could not be resized. Inspect the Task output and CloudWatch logs."
+            }
+          }
+        }
+      }
+    },
+    "StarterRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "CapstoneResourceAccess",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "states:StartExecution",
+                  "Resource": {
+                    "Ref": "Workflow"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-starter:*"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "Starter": {
+      "Type": "AWS::Lambda::Function",
+      "DependsOn": "StarterLogs",
+      "Properties": {
+        "FunctionName": {
+          "Fn::Sub": "${AWS::StackName}-starter"
+        },
+        "Runtime": "python3.12",
+        "Handler": "index.lambda_handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "StarterRole",
+            "Arn"
+          ]
+        },
+        "Timeout": 15,
+        "MemorySize": 128,
+        "Environment": {
+          "Variables": {
+            "SOURCE_BUCKET": {
+              "Fn::Sub": "${AWS::StackName}-originals-${AWS::AccountId}-${AWS::Region}"
+            },
+            "STATE_MACHINE_ARN": {
+              "Ref": "Workflow"
+            }
+          }
+        },
+        "Code": {
+          "ZipFile": "\"\"\"Start one Standard workflow per S3 object-created notification.\"\"\"\nimport hashlib\nimport json\nimport logging\nimport os\nfrom urllib.parse import unquote_plus\n\nimport boto3\nfrom botocore.exceptions import ClientError\n\nSFN = boto3.client(\"stepfunctions\")\nLOG = logging.getLogger(__name__)\nLOG.setLevel(logging.INFO)\n\n\ndef lambda_handler(event, context):\n    executions = []\n    for record in event.get(\"Records\", []):\n        if not record.get(\"eventName\", \"\").startswith(\"ObjectCreated:\"):\n            continue\n        obj = record[\"s3\"][\"object\"]\n        data = {\"bucket\": record[\"s3\"][\"bucket\"][\"name\"],\n                \"key\": unquote_plus(obj[\"key\"])}\n        if obj.get(\"versionId\"):\n            data[\"versionId\"] = obj[\"versionId\"]\n        if data[\"bucket\"] != os.environ[\"SOURCE_BUCKET\"]:\n            raise ValueError(\"Unexpected source bucket\")\n        # Duplicate notifications for the same event use the same execution name.\n        identity = json.dumps([data, obj.get(\"sequencer\", \"\")], sort_keys=True)\n        name = \"s3-\" + hashlib.sha256(identity.encode()).hexdigest()\n        try:\n            result = SFN.start_execution(stateMachineArn=os.environ[\"STATE_MACHINE_ARN\"],\n                                         name=name, input=json.dumps(data, sort_keys=True))\n            executions.append(result[\"executionArn\"])\n            LOG.info(\"Started workflow for %s: %s\", data[\"key\"], result[\"executionArn\"])\n        except ClientError as error:\n            if error.response[\"Error\"][\"Code\"] != \"ExecutionAlreadyExists\":\n                raise\n            LOG.info(\"Duplicate S3 event skipped: %s\", name)\n    return {\"executions\": executions}\n"
+        }
+      }
+    },
+    "AllowS3Invoke": {
+      "Type": "AWS::Lambda::Permission",
+      "Properties": {
+        "FunctionName": {
+          "Ref": "Starter"
+        },
+        "Action": "lambda:InvokeFunction",
+        "Principal": "s3.amazonaws.com",
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        },
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:s3:::${AWS::StackName}-originals-${AWS::AccountId}-${AWS::Region}"
+        }
+      }
+    },
+    "OriginalsBucket": {
+      "Type": "AWS::S3::Bucket",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "BucketName": {
+          "Fn::Sub": "${AWS::StackName}-originals-${AWS::AccountId}-${AWS::Region}"
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "NotificationConfiguration": {
+          "LambdaConfigurations": [
+            {
+              "Event": "s3:ObjectCreated:*",
+              "Function": {
+                "Fn::GetAtt": [
+                  "Starter",
+                  "Arn"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "DependsOn": [
+        "AllowS3Invoke",
+        "ThumbnailsBucket"
+      ]
+    },
+    "ThumbnailsBucket": {
+      "Type": "AWS::S3::Bucket",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "BucketName": {
+          "Fn::Sub": "${AWS::StackName}-thumbnails-${AWS::AccountId}-${AWS::Region}"
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "BlockPublicPolicy": true,
+          "IgnorePublicAcls": true,
+          "RestrictPublicBuckets": true
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "ApiRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "apigateway.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "CapstoneResourceAccess",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "states:StartExecution",
+                  "Resource": {
+                    "Ref": "Workflow"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "Api": {
+      "Type": "AWS::ApiGateway::RestApi",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${AWS::StackName}-api"
+        },
+        "EndpointConfiguration": {
+          "Types": [
+            "REGIONAL"
+          ]
+        }
+      }
+    },
+    "ProcessResource": {
+      "Type": "AWS::ApiGateway::Resource",
+      "Properties": {
+        "RestApiId": {
+          "Ref": "Api"
+        },
+        "ParentId": {
+          "Fn::GetAtt": [
+            "Api",
+            "RootResourceId"
+          ]
+        },
+        "PathPart": "process"
+      }
+    },
+    "ProcessMethod": {
+      "Type": "AWS::ApiGateway::Method",
+      "Properties": {
+        "RestApiId": {
+          "Ref": "Api"
+        },
+        "ResourceId": {
+          "Ref": "ProcessResource"
+        },
+        "HttpMethod": "POST",
+        "AuthorizationType": "AWS_IAM",
+        "Integration": {
+          "Type": "AWS",
+          "IntegrationHttpMethod": "POST",
+          "Credentials": {
+            "Fn::GetAtt": [
+              "ApiRole",
+              "Arn"
+            ]
+          },
+          "Uri": {
+            "Fn::Sub": "arn:${AWS::Partition}:apigateway:${AWS::Region}:states:action/StartExecution"
+          },
+          "PassthroughBehavior": "NEVER",
+          "RequestTemplates": {
+            "application/json": {
+              "Fn::Sub": "{\"input\": \"$util.escapeJavaScript($input.json('$')).replaceAll(\"\\\\'\", \"'\")\", \"stateMachineArn\": \"${Workflow}\"}"
+            }
+          },
+          "IntegrationResponses": [
+            {
+              "StatusCode": "200",
+              "SelectionPattern": "",
+              "ResponseTemplates": {
+                "application/json": "$input.json('$')"
+              }
+            }
+          ]
+        },
+        "MethodResponses": [
+          {
+            "StatusCode": "200"
+          }
+        ]
+      }
+    },
+    "ApiDeployment": {
+      "Type": "AWS::ApiGateway::Deployment",
+      "DependsOn": "ProcessMethod",
+      "Properties": {
+        "RestApiId": {
+          "Ref": "Api"
+        }
+      }
+    },
+    "ApiStage": {
+      "Type": "AWS::ApiGateway::Stage",
+      "Properties": {
+        "RestApiId": {
+          "Ref": "Api"
+        },
+        "DeploymentId": {
+          "Ref": "ApiDeployment"
+        },
+        "StageName": "demo",
+        "MethodSettings": [
+          {
+            "ResourcePath": "/*",
+            "HttpMethod": "*",
+            "ThrottlingRateLimit": 2,
+            "ThrottlingBurstLimit": 4
+          }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "OriginalsBucket": {
+      "Value": {
+        "Ref": "OriginalsBucket"
+      }
+    },
+    "ThumbnailsBucket": {
+      "Value": {
+        "Ref": "ThumbnailsBucket"
+      }
+    },
+    "StateMachineArn": {
+      "Value": {
+        "Ref": "Workflow"
+      }
+    },
+    "ApiUrl": {
+      "Value": {
+        "Fn::Sub": "https://${Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/demo/process"
+      }
+    }
+  }
+}

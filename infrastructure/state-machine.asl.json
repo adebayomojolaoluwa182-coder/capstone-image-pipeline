@@ -1,0 +1,53 @@
+{
+  "Comment": "Resize an image, check success, and end explicitly.",
+  "StartAt": "ResizeImage",
+  "TimeoutSeconds": 120,
+  "States": {
+    "ResizeImage": {
+      "Type": "Task",
+      "Resource": "${ResizeFunctionArn}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "ProcessingFailed"
+        }
+      ],
+      "Next": "ResizeSuccessful"
+    },
+    "ResizeSuccessful": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.success",
+          "BooleanEquals": true,
+          "Next": "ProcessingSucceeded"
+        }
+      ],
+      "Default": "ProcessingFailed"
+    },
+    "ProcessingSucceeded": {
+      "Type": "Succeed"
+    },
+    "ProcessingFailed": {
+      "Type": "Fail",
+      "Error": "ImageProcessingFailed",
+      "Cause": "The image could not be resized. Inspect the Task output and CloudWatch logs."
+    }
+  }
+}
